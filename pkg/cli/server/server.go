@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	systemd "github.com/coreos/go-systemd/daemon"
+	"github.com/erikdubbelboer/gspt"
 	"github.com/pkg/errors"
 	"github.com/rancher/k3s/pkg/agent"
 	"github.com/rancher/k3s/pkg/cli/cmds"
@@ -41,6 +42,10 @@ func run(app *cli.Context, cfg *cmds.Server) error {
 	var (
 		err error
 	)
+
+	// hide process arguments from ps output, since they may contain
+	// database credentials or other secrets.
+	gspt.SetProcTitle(os.Args[0] + " server")
 
 	if !cfg.DisableAgent && os.Getuid() != 0 && !cfg.Rootless {
 		return fmt.Errorf("must run as root unless --disable-agent is specified")
@@ -105,8 +110,18 @@ func run(app *cli.Context, cfg *cmds.Server) error {
 	serverConfig.ControlConfig.DisableNPC = cfg.DisableNPC
 	serverConfig.ControlConfig.DisableKubeProxy = cfg.DisableKubeProxy
 	serverConfig.ControlConfig.ClusterInit = cfg.ClusterInit
-	serverConfig.ControlConfig.ClusterReset = cfg.ClusterReset
 	serverConfig.ControlConfig.EncryptSecrets = cfg.EncryptSecrets
+	serverConfig.ControlConfig.EtcdSnapshotCron = cfg.EtcdSnapshotCron
+	serverConfig.ControlConfig.EtcdSnapshotDir = cfg.EtcdSnapshotDir
+	serverConfig.ControlConfig.EtcdSnapshotRetention = cfg.EtcdSnapshotRetention
+	serverConfig.ControlConfig.EtcdDisableSnapshots = cfg.EtcdDisableSnapshots
+
+	if cfg.ClusterResetRestorePath != "" && !cfg.ClusterReset {
+		return errors.New("Invalid flag use. --cluster-reset required with --cluster-reset-restore-path")
+	}
+
+	serverConfig.ControlConfig.ClusterReset = cfg.ClusterReset
+	serverConfig.ControlConfig.ClusterResetRestorePath = cfg.ClusterResetRestorePath
 
 	if serverConfig.ControlConfig.SupervisorPort == 0 {
 		serverConfig.ControlConfig.SupervisorPort = serverConfig.ControlConfig.HTTPSPort
@@ -185,18 +200,24 @@ func run(app *cli.Context, cfg *cmds.Server) error {
 		serverConfig.ControlConfig.Disables["ccm"] = true
 	}
 
-	TLSMinVersion := getArgValueFromList("tls-min-version", cfg.ExtraAPIArgs)
-	serverConfig.ControlConfig.TLSMinVersion, err = kubeapiserverflag.TLSVersion(TLSMinVersion)
+	tlsMinVersionArg := getArgValueFromList("tls-min-version", cfg.ExtraAPIArgs)
+	serverConfig.ControlConfig.TLSMinVersion, err = kubeapiserverflag.TLSVersion(tlsMinVersionArg)
 	if err != nil {
-		return errors.Wrapf(err, "Invalid TLS Version %s: %v", TLSMinVersion, err)
+		return errors.Wrap(err, "Invalid tls-min-version")
 	}
+
+	serverConfig.StartupHooks = append(serverConfig.StartupHooks, cfg.StartupHooks...)
 
 	// TLS config based on mozilla ssl-config generator
 	// https://ssl-config.mozilla.org/#server=golang&version=1.13.6&config=intermediate&guideline=5.4
 	// Need to disable the TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256 Cipher for TLS1.2
-	TLSCipherSuites := []string{getArgValueFromList("tls-cipher-suites", cfg.ExtraAPIArgs)}
-	if len(TLSCipherSuites) == 0 || TLSCipherSuites[0] == "" {
-		TLSCipherSuites = []string{
+	tlsCipherSuitesArg := getArgValueFromList("tls-cipher-suites", cfg.ExtraAPIArgs)
+	tlsCipherSuites := strings.Split(tlsCipherSuitesArg, ",")
+	for i := range tlsCipherSuites {
+		tlsCipherSuites[i] = strings.TrimSpace(tlsCipherSuites[i])
+	}
+	if len(tlsCipherSuites) == 0 || tlsCipherSuites[0] == "" {
+		tlsCipherSuites = []string{
 			"TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
 			"TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
 			"TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
@@ -205,9 +226,9 @@ func run(app *cli.Context, cfg *cmds.Server) error {
 			"TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305",
 		}
 	}
-	serverConfig.ControlConfig.TLSCipherSuites, err = kubeapiserverflag.TLSCipherSuites(TLSCipherSuites)
+	serverConfig.ControlConfig.TLSCipherSuites, err = kubeapiserverflag.TLSCipherSuites(tlsCipherSuites)
 	if err != nil {
-		return errors.Wrapf(err, "Invalid TLS Cipher Suites %s: %v", TLSCipherSuites, err)
+		return errors.Wrap(err, "Invalid tls-cipher-suites")
 	}
 
 	logrus.Info("Starting "+version.Program+" ", app.App.Version)
@@ -245,7 +266,7 @@ func run(app *cli.Context, cfg *cmds.Server) error {
 	}
 
 	agentConfig := cmds.AgentConfig
-	agentConfig.Debug = app.GlobalBool("bool")
+	agentConfig.Debug = app.GlobalBool("debug")
 	agentConfig.DataDir = filepath.Dir(serverConfig.ControlConfig.DataDir)
 	agentConfig.ServerURL = url
 	agentConfig.Token = token

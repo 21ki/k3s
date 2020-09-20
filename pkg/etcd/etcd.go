@@ -11,6 +11,8 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -21,8 +23,10 @@ import (
 	"github.com/rancher/k3s/pkg/clientaccess"
 	"github.com/rancher/k3s/pkg/daemons/config"
 	"github.com/rancher/k3s/pkg/daemons/executor"
+	"github.com/robfig/cron/v3"
 	"github.com/sirupsen/logrus"
 	etcd "go.etcd.io/etcd/clientv3"
+	"go.etcd.io/etcd/clientv3/snapshot"
 	"go.etcd.io/etcd/etcdserver/etcdserverpb"
 	utilnet "k8s.io/apimachinery/pkg/util/net"
 )
@@ -33,25 +37,54 @@ type ETCD struct {
 	name    string
 	runtime *config.ControlRuntime
 	address string
+	cron    *cron.Cron
 }
 
+// NewETCD creates a new value of type
+// ETCD with an initialized cron value.
+func NewETCD() *ETCD {
+	return &ETCD{
+		cron: cron.New(),
+	}
+}
+
+const (
+	snapshotPrefix = "etcd-snapshot-"
+	endpoint       = "https://127.0.0.1:2379"
+
+	testTimeout = time.Second * 10
+)
+
+// Members contains a slice that holds all
+// members of the cluster.
 type Members struct {
 	Members []*etcdserverpb.Member `json:"members"`
 }
 
+// EndpointName returns the name of the endpoint.
 func (e *ETCD) EndpointName() string {
 	return "etcd"
 }
 
-func (e *ETCD) Test(ctx context.Context) error {
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+func (e *ETCD) Test(ctx context.Context, clientAccessInfo *clientaccess.Info) error {
+	ctx, cancel := context.WithTimeout(ctx, testTimeout)
 	defer cancel()
+	status, err := e.client.Status(ctx, endpoint)
+	if err != nil {
+		return err
+	}
+
+	if status.IsLearner {
+		if err := e.promoteMember(ctx, clientAccessInfo); err != nil {
+			return err
+		}
+	}
 	members, err := e.client.MemberList(ctx)
 	if err != nil {
 		return err
 	}
 
-	var cluster []string
+	var memberNameUrls []string
 	for _, member := range members.Members {
 		for _, peerURL := range member.PeerURLs {
 			if peerURL == e.peerURL() && e.name == member.Name {
@@ -59,10 +92,10 @@ func (e *ETCD) Test(ctx context.Context) error {
 			}
 		}
 		if len(member.PeerURLs) > 0 {
-			cluster = append(cluster, fmt.Sprintf("%s=%s", member.Name, member.PeerURLs[0]))
+			memberNameUrls = append(memberNameUrls, member.Name+"="+member.PeerURLs[0])
 		}
 	}
-	msg := fmt.Sprintf("This server is a not a member of the etcd cluster "+"found %v and expecting to contain %s=%s", cluster, e.name, e.address)
+	msg := fmt.Sprintf("This server is a not a member of the etcd cluster. Found %v, expect: %s=%s", memberNameUrls, e.name, e.address)
 	logrus.Error(msg)
 	return fmt.Errorf(msg)
 }
@@ -89,11 +122,12 @@ func (e *ETCD) IsInitialized(ctx context.Context, config *config.Control) (bool,
 	}
 }
 
-func (e *ETCD) Reset(ctx context.Context) error {
+func (e *ETCD) Reset(ctx context.Context, clientAccessInfo *clientaccess.Info) error {
 	go func() {
-		for {
-			time.Sleep(5 * time.Second)
-			if err := e.Test(ctx); err == nil {
+		t := time.NewTicker(5 * time.Second)
+		defer t.Stop()
+		for range t.C {
+			if err := e.Test(ctx, clientAccessInfo); err == nil {
 				members, err := e.client.MemberList(ctx)
 				if err != nil {
 					continue
@@ -106,10 +140,26 @@ func (e *ETCD) Reset(ctx context.Context) error {
 			}
 		}
 	}()
+	if e.config.ClusterResetRestorePath != "" {
+		info, err := os.Stat(e.config.ClusterResetRestorePath)
+		if os.IsNotExist(err) {
+			return fmt.Errorf("etcd: snapshot path does not exist: %s", e.config.ClusterResetRestorePath)
+		}
+		if info.IsDir() {
+			return fmt.Errorf("etcd: snapshot path is directory: %s", e.config.ClusterResetRestorePath)
+		}
+		if err := e.Restore(ctx); err != nil {
+			return err
+		}
+	}
+	if err := e.setName(true); err != nil {
+		return err
+	}
+
 	return e.newCluster(ctx, true)
 }
 
-func (e *ETCD) Start(ctx context.Context, clientAccess *clientaccess.Info) error {
+func (e *ETCD) Start(ctx context.Context, clientAccessInfo *clientaccess.Info) error {
 	existingCluster, err := e.IsInitialized(ctx, e.config)
 	if err != nil {
 		return errors.Wrapf(err, "failed to validation")
@@ -120,6 +170,11 @@ func (e *ETCD) Start(ctx context.Context, clientAccess *clientaccess.Info) error
 		return nil
 	}
 
+	if !e.config.EtcdDisableSnapshots {
+		e.setSnapshotFunction(ctx)
+		e.cron.Start()
+	}
+
 	if existingCluster {
 		opt, err := executor.CurrentETCDOptions()
 		if err != nil {
@@ -128,27 +183,17 @@ func (e *ETCD) Start(ctx context.Context, clientAccess *clientaccess.Info) error
 		return e.cluster(ctx, false, opt)
 	}
 
-	if clientAccess == nil {
+	if clientAccessInfo == nil {
 		return e.newCluster(ctx, false)
 	}
-	err = e.join(ctx, clientAccess)
+	err = e.join(ctx, clientAccessInfo)
 	return errors.Wrap(err, "joining etcd cluster")
 }
 
 func (e *ETCD) join(ctx context.Context, clientAccessInfo *clientaccess.Info) error {
-	resp, err := clientaccess.Get("/db/info", clientAccessInfo)
+	clientURLs, memberList, err := e.clientURLs(ctx, clientAccessInfo)
 	if err != nil {
 		return err
-	}
-
-	var memberList Members
-	if err := json.Unmarshal(resp, &memberList); err != nil {
-		return err
-	}
-
-	var clientURLs []string
-	for _, member := range memberList.Members {
-		clientURLs = append(clientURLs, member.ClientURLs...)
 	}
 
 	client, err := joinClient(ctx, e.runtime, clientURLs)
@@ -197,11 +242,13 @@ func (e *ETCD) join(ctx context.Context, clientAccessInfo *clientaccess.Info) er
 
 	if add {
 		logrus.Infof("Adding %s to etcd cluster %v", e.peerURL(), cluster)
-		if _, err = client.MemberAdd(ctx, []string{e.peerURL()}); err != nil {
+		if _, err = client.MemberAddAsLearner(ctx, []string{e.peerURL()}); err != nil {
 			return err
 		}
 		cluster = append(cluster, fmt.Sprintf("%s=%s", e.name, e.peerURL()))
 	}
+
+	go e.promoteMember(ctx, clientAccessInfo)
 
 	logrus.Infof("Starting etcd for cluster %v", cluster)
 	return e.cluster(ctx, false, executor.InitialOptions{
@@ -226,22 +273,22 @@ func (e *ETCD) Register(ctx context.Context, config *config.Control, l net.Liste
 	}
 	e.address = address
 
-	e.config.Datastore.Endpoint = "https://127.0.0.1:2379"
+	e.config.Datastore.Endpoint = endpoint
 	e.config.Datastore.Config.CAFile = e.runtime.ETCDServerCA
 	e.config.Datastore.Config.CertFile = e.runtime.ClientETCDCert
 	e.config.Datastore.Config.KeyFile = e.runtime.ClientETCDKey
 
-	if err := e.setName(); err != nil {
+	if err := e.setName(false); err != nil {
 		return nil, nil, err
 	}
 
 	return l, e.handler(handler), err
 }
 
-func (e *ETCD) setName() error {
+func (e *ETCD) setName(force bool) error {
 	fileName := nameFile(e.config)
 	data, err := ioutil.ReadFile(fileName)
-	if os.IsNotExist(err) {
+	if os.IsNotExist(err) || force {
 		h, err := os.Hostname()
 		if err != nil {
 			return err
@@ -314,7 +361,7 @@ func newClient(ctx context.Context, runtime *config.ControlRuntime) (*etcd.Clien
 
 	cfg := etcd.Config{
 		Context:   ctx,
-		Endpoints: []string{"https://127.0.0.1:2379"},
+		Endpoints: []string{endpoint},
 		TLS:       tlsConfig,
 	}
 
@@ -373,7 +420,7 @@ func (e *ETCD) cluster(ctx context.Context, forceNew bool, options executor.Init
 		InitialOptions:      options,
 		ForceNewCluster:     forceNew,
 		ListenClientURLs:    fmt.Sprintf(e.clientURL() + ",https://127.0.0.1:2379"),
-		ListenMetricsURLs:   fmt.Sprintf("http://127.0.0.1:2381"),
+		ListenMetricsURLs:   "http://127.0.0.1:2381",
 		ListenPeerURLs:      e.peerURL(),
 		AdvertiseClientURLs: e.clientURL(),
 		DataDir:             dataDir(e.config),
@@ -418,4 +465,185 @@ func (e *ETCD) removePeer(ctx context.Context, id, address string) error {
 	}
 
 	return nil
+}
+
+func (e *ETCD) promoteMember(ctx context.Context, clientAccessInfo *clientaccess.Info) error {
+	clientURLs, _, err := e.clientURLs(ctx, clientAccessInfo)
+	if err != nil {
+		return err
+	}
+	memberPromoted := true
+	t := time.NewTicker(5 * time.Second)
+	defer t.Stop()
+	for range t.C {
+		client, err := joinClient(ctx, e.runtime, clientURLs)
+		// continue on errors to keep trying to promote member
+		// grpc error are shown so no need to re log them
+		if err != nil {
+			continue
+		}
+		members, err := client.MemberList(ctx)
+		if err != nil {
+			continue
+		}
+		for _, member := range members.Members {
+			// only one learner can exist in the cluster
+			if !member.IsLearner {
+				continue
+			}
+			if _, err := client.MemberPromote(ctx, member.ID); err != nil {
+				memberPromoted = false
+				break
+			}
+		}
+		if memberPromoted {
+			break
+		}
+	}
+	return nil
+}
+
+func (e *ETCD) clientURLs(ctx context.Context, clientAccessInfo *clientaccess.Info) ([]string, Members, error) {
+	var memberList Members
+	resp, err := clientaccess.Get("/db/info", clientAccessInfo)
+	if err != nil {
+		return nil, memberList, err
+	}
+
+	if err := json.Unmarshal(resp, &memberList); err != nil {
+		return nil, memberList, err
+	}
+
+	var clientURLs []string
+	for _, member := range memberList.Members {
+		// excluding learner member from the client list
+		if member.IsLearner {
+			continue
+		}
+		clientURLs = append(clientURLs, member.ClientURLs...)
+	}
+	return clientURLs, memberList, nil
+}
+
+func snapshotDir(config *config.Control) (string, error) {
+	if config.EtcdSnapshotDir == "" {
+		// we have to create the snapshot dir if we are using
+		// the default snapshot dir if it doesn't exist
+		defaultSnapshotDir := filepath.Join(config.DataDir, "db", "snapshots")
+		s, err := os.Stat(defaultSnapshotDir)
+		if err != nil {
+			if os.IsNotExist(err) {
+				if err := os.MkdirAll(defaultSnapshotDir, 0700); err != nil {
+					return "", err
+				}
+				return defaultSnapshotDir, nil
+			}
+			return "", err
+		}
+		if s.IsDir() {
+			return defaultSnapshotDir, nil
+		}
+	}
+	return config.EtcdSnapshotDir, nil
+}
+
+func (e *ETCD) snapshot(ctx context.Context) {
+	snapshotTime := time.Now()
+	logrus.Infof("Snapshot retention check")
+	snapshotDir, err := snapshotDir(e.config)
+	if err != nil {
+		logrus.Errorf("failed to get the snapshot dir: %v", err)
+		return
+	}
+	logrus.Infof("Taking etcd snapshot at %s", snapshotTime.String())
+	sManager := snapshot.NewV3(nil)
+	tlsConfig, err := toTLSConfig(e.runtime)
+	if err != nil {
+		logrus.Errorf("failed to get tls config for etcd: %v", err)
+		return
+	}
+	etcdConfig := etcd.Config{
+		Context:   ctx,
+		Endpoints: []string{endpoint},
+		TLS:       tlsConfig,
+	}
+	snapshotPath := filepath.Join(snapshotDir, snapshotPrefix+strconv.Itoa(int(snapshotTime.Unix())))
+
+	if err := sManager.Save(ctx, etcdConfig, snapshotPath); err != nil {
+		logrus.Errorf("failed to save snapshot %s: %v", snapshotPath, err)
+		return
+	}
+	if err := snapshotRetention(e.config.EtcdSnapshotRetention, snapshotDir); err != nil {
+		logrus.Errorf("failed to apply snapshot retention: %v", err)
+		return
+	}
+}
+
+// snapshot performs an ETCD snapshot at the given interval and
+// saves the file to either the default snapshot directory or
+// the user provided directory.
+func (e *ETCD) setSnapshotFunction(ctx context.Context) {
+	e.cron.AddFunc(e.config.EtcdSnapshotCron, func() { e.snapshot(ctx) })
+}
+
+// Restore performs a restore of the ETCD datastore from
+// the given snapshot path. This operation exists upon
+// completion.
+func (e *ETCD) Restore(ctx context.Context) error {
+	// check the old etcd data dir
+	oldDataDir := dataDir(e.config) + "-old"
+	if s, err := os.Stat(oldDataDir); err == nil && s.IsDir() {
+		logrus.Infof("etcd already restored from a snapshot. Restart without --snapshot-restore-path flag. Backup and delete ${datadir}/server/db on each peer etcd server and rejoin the nodes")
+		os.Exit(0)
+	} else if os.IsNotExist(err) {
+		if e.config.ClusterResetRestorePath == "" {
+			return errors.New("no etcd restore path was specified")
+		}
+		// make sure snapshot exists before restoration
+		if _, err := os.Stat(e.config.ClusterResetRestorePath); err != nil {
+			return err
+		}
+		// move the data directory to a temp path
+		if err := os.Rename(dataDir(e.config), oldDataDir); err != nil {
+			return err
+		}
+		sManager := snapshot.NewV3(nil)
+		if err := sManager.Restore(snapshot.RestoreConfig{
+			SnapshotPath:   e.config.ClusterResetRestorePath,
+			Name:           e.name,
+			OutputDataDir:  dataDir(e.config),
+			OutputWALDir:   walDir(e.config),
+			PeerURLs:       []string{e.peerURL()},
+			InitialCluster: e.name + "=" + e.peerURL(),
+		}); err != nil {
+			return err
+		}
+	} else {
+		return err
+	}
+	return nil
+}
+
+// snapshotRetention iterates through the snapshots and removes the oldest
+// leaving the desired number of snapshots.
+func snapshotRetention(retention int, snapshotDir string) error {
+	var snapshotFiles []os.FileInfo
+	if err := filepath.Walk(snapshotDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if strings.HasPrefix(info.Name(), snapshotPrefix) {
+			snapshotFiles = append(snapshotFiles, info)
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	if len(snapshotFiles) <= retention {
+		return nil
+	}
+	sort.Slice(snapshotFiles, func(i, j int) bool {
+		return snapshotFiles[i].Name() < snapshotFiles[j].Name()
+	})
+	return os.Remove(filepath.Join(snapshotDir, snapshotFiles[0].Name()))
 }

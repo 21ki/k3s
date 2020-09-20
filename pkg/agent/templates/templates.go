@@ -10,7 +10,6 @@ import (
 type ContainerdConfig struct {
 	NodeConfig            *config.Node
 	IsRunningInUserNS     bool
-	SELinuxEnabled        bool
 	PrivateRegistryConfig *Registry
 }
 
@@ -21,7 +20,7 @@ const ContainerdConfigTemplate = `
 [plugins.cri]
   stream_server_address = "127.0.0.1"
   stream_server_port = "10010"
-  enable_selinux = {{ .SELinuxEnabled }}
+  enable_selinux = {{ .NodeConfig.SELinux }}
 
 {{- if .IsRunningInUserNS }}
   disable_cgroup = true
@@ -31,6 +30,11 @@ const ContainerdConfigTemplate = `
 
 {{- if .NodeConfig.AgentConfig.PauseImage }}
   sandbox_image = "{{ .NodeConfig.AgentConfig.PauseImage }}"
+{{end}}
+
+{{- if .NodeConfig.AgentConfig.Snapshotter }}
+[plugins.cri.containerd]
+  snapshotter = "{{ .NodeConfig.AgentConfig.Snapshotter }}"
 {{end}}
 
 {{- if not .NodeConfig.NoFlannel }}
@@ -63,6 +67,7 @@ const ContainerdConfigTemplate = `
   {{ if $v.TLS.CAFile }}ca_file = "{{ $v.TLS.CAFile }}"{{end}}
   {{ if $v.TLS.CertFile }}cert_file = "{{ $v.TLS.CertFile }}"{{end}}
   {{ if $v.TLS.KeyFile }}key_file = "{{ $v.TLS.KeyFile }}"{{end}}
+  {{ if $v.TLS.InsecureSkipVerify }}insecure_skip_verify = true{{end}}
 {{end}}
 {{end}}
 {{end}}

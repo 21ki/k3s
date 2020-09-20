@@ -3,6 +3,7 @@ package cluster
 import (
 	"context"
 	"crypto/tls"
+	"log"
 	"net"
 	"net/http"
 	"path/filepath"
@@ -33,12 +34,13 @@ func (c *Cluster) newListener(ctx context.Context) (net.Listener, http.Handler, 
 	return dynamiclistener.NewListener(tcp, storage, cert, key, dynamiclistener.Config{
 		CN:           version.Program,
 		Organization: []string{version.Program},
-		TLSConfig: tls.Config{
+		TLSConfig: &tls.Config{
 			ClientAuth:   tls.RequestClientCert,
 			MinVersion:   c.config.TLSMinVersion,
 			CipherSuites: c.config.TLSCipherSuites,
 		},
-		SANs: append(c.config.SANs, "localhost", "kubernetes", "kubernetes.default", "kubernetes.default.svc."+c.config.ClusterDomain),
+		SANs:                append(c.config.SANs, "localhost", "kubernetes", "kubernetes.default", "kubernetes.default.svc."+c.config.ClusterDomain),
+		ExpirationDaysCheck: config.CertificateRenewDays,
 	})
 }
 
@@ -59,7 +61,8 @@ func (c *Cluster) initClusterAndHTTPS(ctx context.Context) error {
 	}
 
 	server := http.Server{
-		Handler: handler,
+		Handler:  handler,
+		ErrorLog: log.New(logrus.StandardLogger().Writer(), "Cluster-Http-Server ", log.LstdFlags),
 	}
 
 	go func() {

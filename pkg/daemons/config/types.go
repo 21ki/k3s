@@ -20,13 +20,14 @@ const (
 	FlannelBackendHostGW    = "host-gw"
 	FlannelBackendIPSEC     = "ipsec"
 	FlannelBackendWireguard = "wireguard"
+	CertificateRenewDays    = 90
 )
 
 type Node struct {
 	Docker                   bool
 	ContainerRuntimeEndpoint string
 	NoFlannel                bool
-	DisableSELinux           bool
+	SELinux                  bool
 	FlannelBackend           string
 	FlannelConf              string
 	FlannelConfOverride      bool
@@ -46,6 +47,7 @@ type Containerd struct {
 	Config   string
 	Opt      string
 	Template string
+	SELinux  bool
 }
 
 type Agent struct {
@@ -72,6 +74,7 @@ type Agent struct {
 	ExtraKubeletArgs        []string
 	ExtraKubeProxyArgs      []string
 	PauseImage              string
+	Snapshotter             string
 	CNIPlugin               bool
 	NodeTaints              []string
 	NodeLabels              []string
@@ -82,6 +85,7 @@ type Agent struct {
 	DisableNPC              bool
 	DisableKubeProxy        bool
 	Rootless                bool
+	ProtectKernelDefaults   bool
 }
 
 type Control struct {
@@ -122,9 +126,14 @@ type Control struct {
 	DisableKubeProxy         bool
 	ClusterInit              bool
 	ClusterReset             bool
+	ClusterResetRestorePath  string
 	EncryptSecrets           bool
 	TLSMinVersion            uint16
 	TLSCipherSuites          []uint16
+	EtcdDisableSnapshots     bool
+	EtcdSnapshotDir          string
+	EtcdSnapshotCron         string
+	EtcdSnapshotRetention    int
 
 	BindAddress string
 	SANs        []string

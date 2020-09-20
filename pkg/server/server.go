@@ -13,6 +13,8 @@ import (
 	"strings"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
+
 	"github.com/pkg/errors"
 	"github.com/rancher/helm-controller/pkg/helm"
 	"github.com/rancher/k3s/pkg/clientaccess"
@@ -58,6 +60,12 @@ func StartServer(ctx context.Context, config *Config) error {
 		return errors.Wrap(err, "starting tls server")
 	}
 
+	for _, hook := range config.StartupHooks {
+		if err := hook(ctx, config.ControlConfig.Runtime.APIServerReady, config.ControlConfig.Runtime.KubeConfigAdmin); err != nil {
+			return errors.Wrap(err, "startup hook")
+		}
+	}
+
 	ip := net2.ParseIP(config.ControlConfig.BindAddress)
 	if ip == nil {
 		hostIP, err := net.ChooseHostInterface()
@@ -95,7 +103,7 @@ func startWrangler(ctx context.Context, config *Config) error {
 			return
 		case <-config.ControlConfig.Runtime.APIServerReady:
 			if err := runControllers(ctx, config); err != nil {
-				logrus.Fatal("failed to start controllers: %v", err)
+				logrus.Fatalf("failed to start controllers: %v", err)
 			}
 		}
 	}()
@@ -137,6 +145,9 @@ func runControllers(ctx context.Context, config *Config) error {
 	if !config.DisableAgent {
 		go setMasterRoleLabel(ctx, sc.Core.Core().V1().Node())
 	}
+
+	go setClusterDNSConfig(ctx, config, sc.Core.Core().V1().ConfigMap())
+
 	if controlConfig.NoLeaderElect {
 		go func() {
 			start(ctx)
@@ -159,6 +170,7 @@ func masterControllers(ctx context.Context, sc *Context, config *Config) error {
 
 	helm.Register(ctx, sc.Apply,
 		sc.Helm.Helm().V1().HelmChart(),
+		sc.Helm.Helm().V1().HelmChartConfig(),
 		sc.Batch.Batch().V1().Job(),
 		sc.Auth.Rbac().V1().ClusterRoleBinding(),
 		sc.Core.Core().V1().ServiceAccount(),
@@ -277,8 +289,11 @@ func writeKubeConfig(certs string, config *Config) error {
 	}
 
 	if err = clientaccess.WriteClientKubeConfig(kubeConfig, url, config.ControlConfig.Runtime.ServerCA, config.ControlConfig.Runtime.ClientAdminCert,
-		config.ControlConfig.Runtime.ClientAdminKey); err != nil {
+		config.ControlConfig.Runtime.ClientAdminKey); err == nil {
+		logrus.Infof("Wrote kubeconfig %s", kubeConfig)
+	} else {
 		logrus.Errorf("Failed to generate kubeconfig: %v", err)
+		return err
 	}
 
 	if config.ControlConfig.KubeConfigMode != "" {
@@ -298,7 +313,6 @@ func writeKubeConfig(certs string, config *Config) error {
 		}
 	}
 
-	logrus.Infof("Wrote kubeconfig %s", kubeConfig)
 	if def {
 		logrus.Infof("Run: %s kubectl", filepath.Base(os.Args[0]))
 	}
@@ -419,9 +433,50 @@ func setMasterRoleLabel(ctx context.Context, nodes v1.NodeClient) error {
 		node.Labels[MasterRoleLabelKey] = "true"
 		_, err = nodes.Update(node)
 		if err == nil {
-			logrus.Infof("master role label has been set succesfully on node: %s", nodeName)
+			logrus.Infof("master role label has been set successfully on node: %s", nodeName)
 			break
 		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Second):
+		}
+	}
+	return nil
+}
+
+func setClusterDNSConfig(ctx context.Context, controlConfig *Config, configMap v1.ConfigMapClient) error {
+	nodeName := os.Getenv("NODE_NAME")
+	// check if configmap already exists
+	_, err := configMap.Get("kube-system", "cluster-dns", metav1.GetOptions{})
+	if err == nil {
+		logrus.Infof("cluster dns configmap already exists")
+		return nil
+	}
+	clusterDNS := controlConfig.ControlConfig.ClusterDNS
+	clusterDomain := controlConfig.ControlConfig.ClusterDomain
+	c := &corev1.ConfigMap{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "ConfigMap",
+			APIVersion: "v1",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "cluster-dns",
+			Namespace: "kube-system",
+		},
+		Data: map[string]string{
+			"clusterDNS":    clusterDNS.String(),
+			"clusterDomain": clusterDomain,
+		},
+	}
+	for {
+		_, err = configMap.Create(c)
+		if err == nil {
+			logrus.Infof("cluster dns configmap has been set successfully")
+			break
+		}
+		logrus.Infof("Waiting for master node %s startup: %v", nodeName, err)
+
 		select {
 		case <-ctx.Done():
 			return ctx.Err()

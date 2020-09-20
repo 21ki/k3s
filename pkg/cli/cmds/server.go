@@ -1,12 +1,17 @@
 package cmds
 
 import (
+	"context"
+
 	"github.com/rancher/k3s/pkg/version"
 	"github.com/urfave/cli"
 )
 
 const (
 	DisableItems = "coredns, servicelb, traefik, local-storage, metrics-server"
+
+	defaultSnapshotRentention    = 5
+	defaultSnapshotIntervalHours = 12
 )
 
 type Server struct {
@@ -52,7 +57,13 @@ type Server struct {
 	DisableKubeProxy         bool
 	ClusterInit              bool
 	ClusterReset             bool
+	ClusterResetRestorePath  string
 	EncryptSecrets           bool
+	StartupHooks             []func(context.Context, <-chan struct{}, string) error
+	EtcdDisableSnapshots     bool
+	EtcdSnapshotDir          string
+	EtcdSnapshotCron         string
+	EtcdSnapshotRetention    int
 }
 
 var ServerConfig Server
@@ -62,8 +73,11 @@ func NewServerCommand(action func(*cli.Context) error) cli.Command {
 		Name:      "server",
 		Usage:     "Run management server",
 		UsageText: appName + " server [OPTIONS]",
+		Before:    SetupDebug(CheckSELinuxFlags),
 		Action:    action,
 		Flags: []cli.Flag{
+			ConfigFlag,
+			DebugFlag,
 			VLevel,
 			VModule,
 			LogFile,
@@ -197,6 +211,28 @@ func NewServerCommand(action func(*cli.Context) error) cli.Command {
 				Destination: &ServerConfig.DatastoreKeyFile,
 				EnvVar:      version.ProgramUpper + "_DATASTORE_KEYFILE",
 			},
+			&cli.BoolFlag{
+				Name:        "etcd-disable-snapshots",
+				Usage:       "(db) Disable automatic etcd snapshots",
+				Destination: &ServerConfig.EtcdDisableSnapshots,
+			},
+			&cli.StringFlag{
+				Name:        "etcd-snapshot-schedule-cron",
+				Usage:       "(db) Snapshot interval time in cron spec. eg. every 5 hours '* */5 * * *'",
+				Destination: &ServerConfig.EtcdSnapshotCron,
+				Value:       "0 */12 * * *",
+			},
+			&cli.IntFlag{
+				Name:        "etcd-snapshot-retention",
+				Usage:       "(db) Number of snapshots to retain",
+				Destination: &ServerConfig.EtcdSnapshotRetention,
+				Value:       defaultSnapshotRentention,
+			},
+			&cli.StringFlag{
+				Name:        "etcd-snapshot-dir",
+				Usage:       "(db) Directory to save db snapshots. (Default location: ${data-dir}/db/snapshots)",
+				Destination: &ServerConfig.EtcdSnapshotDir,
+			},
 			cli.StringFlag{
 				Name:        "default-local-storage-path",
 				Usage:       "(storage) Default local storage path for local provisioner storage class",
@@ -231,9 +267,9 @@ func NewServerCommand(action func(*cli.Context) error) cli.Command {
 			NodeLabels,
 			NodeTaints,
 			DockerFlag,
-			DisableSELinuxFlag,
 			CRIEndpointFlag,
 			PauseImageFlag,
+			SnapshotterFlag,
 			PrivateRegistryFlag,
 			NodeIPFlag,
 			NodeExternalIPFlag,
@@ -242,6 +278,7 @@ func NewServerCommand(action func(*cli.Context) error) cli.Command {
 			FlannelConfFlag,
 			ExtraKubeletArgs,
 			ExtraKubeProxyArgs,
+			ProtectKernelDefaultsFlag,
 			cli.BoolFlag{
 				Name:        "rootless",
 				Usage:       "(experimental) Run rootless",
@@ -261,32 +298,40 @@ func NewServerCommand(action func(*cli.Context) error) cli.Command {
 			},
 			cli.StringFlag{
 				Name:        "server,s",
+				Hidden:      hideClusterFlags,
 				Usage:       "(experimental/cluster) Server to connect to, used to join a cluster",
 				EnvVar:      version.ProgramUpper + "_URL",
 				Destination: &ServerConfig.ServerURL,
 			},
 			cli.BoolFlag{
 				Name:        "cluster-init",
-				Hidden:      hideDqlite,
-				Usage:       "(experimental/cluster) Initialize new cluster master",
+				Hidden:      hideClusterFlags,
+				Usage:       "(experimental/cluster) Initialize a new cluster",
 				EnvVar:      version.ProgramUpper + "_CLUSTER_INIT",
 				Destination: &ServerConfig.ClusterInit,
 			},
 			cli.BoolFlag{
 				Name:        "cluster-reset",
-				Hidden:      hideDqlite,
-				Usage:       "(experimental/cluster) Forget all peers and become a single cluster new cluster master",
+				Hidden:      hideClusterFlags,
+				Usage:       "(experimental/cluster) Forget all peers and become sole member of a new cluster",
 				EnvVar:      version.ProgramUpper + "_CLUSTER_RESET",
 				Destination: &ServerConfig.ClusterReset,
+			},
+			&cli.StringFlag{
+				Name:        "cluster-reset-restore-path",
+				Usage:       "(db) Path to snapshot file to be restored",
+				Destination: &ServerConfig.ClusterResetRestorePath,
 			},
 			cli.BoolFlag{
 				Name:        "secrets-encryption",
 				Usage:       "(experimental) Enable Secret encryption at rest",
 				Destination: &ServerConfig.EncryptSecrets,
 			},
+			&SELinuxFlag,
 
 			// Hidden/Deprecated flags below
 
+			&DisableSELinuxFlag,
 			FlannelFlag,
 			cli.StringSliceFlag{
 				Name:  "no-deploy",

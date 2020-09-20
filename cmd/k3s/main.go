@@ -40,6 +40,9 @@ func main() {
 }
 
 func runCLIs() bool {
+	if os.Getenv("CRI_CONFIG_FILE") == "" {
+		os.Setenv("CRI_CONFIG_FILE", datadir.DefaultDataDir+"/agent/etc/crictl.yaml")
+	}
 	for _, cmd := range []string{"kubectl", "ctr", "crictl"} {
 		if filepath.Base(os.Args[0]) == cmd {
 			if err := externalCLI(cmd, "", os.Args[1:]); err != nil {
@@ -136,6 +139,17 @@ func extract(dataDir string) (string, error) {
 	os.RemoveAll(tempDest)
 
 	if err := untar.Untar(buf, tempDest); err != nil {
+		return "", err
+	}
+
+	currentSymLink := filepath.Join(dataDir, "data", "current")
+	previousSymLink := filepath.Join(dataDir, "data", "previous")
+	if _, err := os.Lstat(currentSymLink); err == nil {
+		if err := os.Rename(currentSymLink, previousSymLink); err != nil {
+			return "", err
+		}
+	}
+	if err := os.Symlink(dir, currentSymLink); err != nil {
 		return "", err
 	}
 

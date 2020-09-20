@@ -102,8 +102,13 @@ func Server(ctx context.Context, cfg *config.Control) error {
 		return err
 	}
 
+	basicAuth, err := basicAuthenticator(runtime.PasswdFile)
+	if err != nil {
+		return err
+	}
+
+	runtime.Authenticator = combineAuthenticators(basicAuth, auth)
 	runtime.Handler = handler
-	runtime.Authenticator = auth
 
 	if !cfg.NoScheduler {
 		if err := scheduler(cfg, runtime); err != nil {
@@ -130,11 +135,13 @@ func controllerManager(cfg *config.Control, runtime *config.ControlRuntime) erro
 		"cluster-cidr":                     cfg.ClusterIPRange.String(),
 		"root-ca-file":                     runtime.ServerCA,
 		"port":                             "10252",
+		"profiling":                        "false",
+		"address":                          localhostIP.String(),
 		"bind-address":                     localhostIP.String(),
 		"secure-port":                      "0",
 		"use-service-account-credentials":  "true",
-		"cluster-signing-cert-file":        runtime.ServerCA,
-		"cluster-signing-key-file":         runtime.ServerCAKey,
+		"cluster-signing-cert-file":        runtime.ClientCA,
+		"cluster-signing-key-file":         runtime.ClientCAKey,
 	}
 	if cfg.NoLeaderElect {
 		argsMap["leader-elect"] = "false"
@@ -150,6 +157,7 @@ func scheduler(cfg *config.Control, runtime *config.ControlRuntime) error {
 	argsMap := map[string]string{
 		"kubeconfig":   runtime.KubeConfigScheduler,
 		"port":         "10251",
+		"address":      "127.0.0.1",
 		"bind-address": "127.0.0.1",
 		"secure-port":  "0",
 		"profiling":    "false",
@@ -192,7 +200,6 @@ func apiServer(ctx context.Context, cfg *config.Control, runtime *config.Control
 	argsMap["service-account-key-file"] = runtime.ServiceKey
 	argsMap["service-account-issuer"] = version.Program
 	argsMap["api-audiences"] = "unknown"
-	argsMap["basic-auth-file"] = runtime.PasswdFile
 	argsMap["kubelet-certificate-authority"] = runtime.ServerCA
 	argsMap["kubelet-client-certificate"] = runtime.ClientKubeAPICert
 	argsMap["kubelet-client-key"] = runtime.ClientKubeAPIKey
@@ -544,8 +551,8 @@ func genClientCerts(config *config.Control, runtime *config.ControlRuntime) erro
 	if _, err = factory("system:kube-proxy", nil, runtime.ClientKubeProxyCert, runtime.ClientKubeProxyKey); err != nil {
 		return err
 	}
-	// this must be hardcoded to k3s-controller because it's hard coded in the rolebindings.yaml
-	if _, err = factory("system:k3s-controller", nil, runtime.ClientK3sControllerCert, runtime.ClientK3sControllerKey); err != nil {
+	// This user (system:k3s-controller by default) must be bound to a role in rolebindings.yaml or the downstream equivalent
+	if _, err = factory("system:"+version.Program+"-controller", nil, runtime.ClientK3sControllerCert, runtime.ClientK3sControllerKey); err != nil {
 		return err
 	}
 
@@ -895,7 +902,7 @@ func expired(certFile string, pool *x509.CertPool) bool {
 	if err != nil {
 		return true
 	}
-	return certutil.IsCertExpired(certificates[0])
+	return certutil.IsCertExpired(certificates[0], config.CertificateRenewDays)
 }
 
 func cloudControllerManager(ctx context.Context, cfg *config.Control, runtime *config.ControlRuntime) {
